@@ -41,7 +41,6 @@ FlowRunnerInitializeResult = NamedTuple(
 )
 
 
-
 class FlowRunner(Runner):
     """
     FlowRunners handle the execution of Flows and determine the State of a Flow
@@ -91,10 +90,29 @@ class FlowRunner(Runner):
         if task_runner_cls is None:
             task_runner_cls = prefect.engine.get_default_task_runner_class()
         self.task_runner_cls = task_runner_cls
+        self._task_states = None
+        self._sorted_tasks = None
+
         super().__init__(state_handlers=state_handlers)
 
     def __repr__(self) -> str:
         return "<{}: {}>".format(type(self).__name__, self.flow.name)
+
+    @property
+    def task_states(self):
+        return self._task_states
+
+    @property
+    def sorted_tasks(self):
+        return self._sorted_tasks
+
+    def get_next_task(self):
+        # Get the next available task (one that does not have a Success state)
+        for _sorted_task in self._sorted_tasks:
+            task_state = self._task_states.get(_sorted_task, None)
+            if not isinstance(task_state, Success):
+                return _sorted_task
+        return None
 
     def call_runner_target_handlers(self, old_state: State, new_state: State) -> State:
         """
@@ -409,18 +427,25 @@ class FlowRunner(Runner):
             }
 
         # -- process each task in order
-
+        self._sorted_tasks = self.flow.sorted_tasks()
+        self._task_states = task_states
         with executor.start():
 
-            for task in self.flow.sorted_tasks():
-                task_state = task_states.get(task)
+            while True:
+                # Try to get the next task to process.
+                task = self.get_next_task()
+
+                # If there are no more tasks then exit.
+                if task is None:
+                    break
+                task_state = self._task_states.get(task)
 
                 # if a task is a constant task, we already know its return value
                 # no need to use up resources by running it through a task runner
                 if task_state is None and isinstance(
                     task, prefect.tasks.core.constants.Constant
                 ):
-                    task_states[task] = task_state = Success(result=task.value)
+                    self._task_states[task] = task_state = Success(result=task.value)
 
                 # if the state is finished, don't run the task, just use the provided state if
                 # the state is cached / mapped, we still want to run the task runner pipeline
@@ -443,7 +468,7 @@ class FlowRunner(Runner):
 
                 # -- process each edge to the task
                 for edge in self.flow.edges_to(task):
-                    upstream_states[edge] = task_states.get(
+                    upstream_states[edge] = self._task_states.get(
                         edge.upstream_task, Pending(message="Task state not available.")
                     )
 
@@ -477,7 +502,7 @@ class FlowRunner(Runner):
                     # we submit the task to the task runner to determine if
                     # we can proceed with mapping - if the new task state is not a Mapped
                     # state then we don't proceed
-                    task_states[task] = executor.wait(
+                    self._task_states[task] = executor.wait(
                         executor.submit(
                             run_task,
                             task=task,
@@ -498,7 +523,7 @@ class FlowRunner(Runner):
                     # either way, we should now have enough resolved states to restructure
                     # the upstream states into a list of upstream state dictionaries to iterate over
                     list_of_upstream_states = prepare_upstream_states_for_mapping(
-                        task_states[task], upstream_states, mapped_children
+                        self._task_states[task], upstream_states, mapped_children
                     )
 
                     submitted_states = []
@@ -538,11 +563,11 @@ class FlowRunner(Runner):
                                 extra_context=extra_context(task, task_index=idx),
                             )
                         )
-                    if isinstance(task_states.get(task), Mapped):
+                    if isinstance(self._task_states.get(task), Mapped):
                         mapped_children[task] = submitted_states  # type: ignore
 
                 else:
-                    task_states[task] = executor.submit(
+                    self._task_states[task] = executor.submit(
                         run_task,
                         task=task,
                         state=task_state,
@@ -569,7 +594,7 @@ class FlowRunner(Runner):
             final_tasks = terminal_tasks.union(reference_tasks).union(return_tasks)
             final_states = executor.wait(
                 {
-                    t: task_states.get(t, Pending("Task not evaluated by FlowRunner."))
+                    t: self._task_states.get(t, Pending("Task not evaluated by FlowRunner."))
                     for t in final_tasks
                 }
             )
